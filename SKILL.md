@@ -76,6 +76,19 @@ save_and_close(level)
 | `build_arch(…, z1, z2, height)` | Arch gate along z-axis |
 | `build_pitched_roof(…, axis)` | Sloped stair/slab roof |
 
+### Connection Fix (Post-Processing)
+
+| Function | Purpose |
+|----------|---------|
+| `update_connections(level, x1,z1, x2,z2, dim, ver, y1=None, y2=None)` | Fix fence/glass_pane/wall/iron_bars connections in a region |
+
+**Must call after building** to make fences, glass panes, walls, and iron bars connect properly. Without this, they appear as individual posts.
+
+```python
+# Example: fix connections for a house built at (bx, bz) to (bx+w, bz+d)
+update_connections(level, bx-1, bz-1, bx+w+1, bz+d+1, dim, ver, y1=by, y2=by+h+5)
+```
+
 ### Smart Pathfinding
 
 | Function | Purpose |
@@ -163,9 +176,10 @@ Constants available: `FLOWERS`, `POTTED_FLOWERS`, `NATURAL_GROUND`, `BUILDING_BL
 1. `quick_setup()` — auto backup + player pos + version
 2. `scan_terrain()` / `scan_ground()` / `flatten_area()` — understand and prepare terrain
 3. Build bottom-up: foundation → floor → walls → interior → roof → decoration
-4. `build_smart_path()` to connect buildings with terrain-following paths
-5. `level.save()` periodically for large builds
-6. `save_and_close(level)` when done
+4. **`update_connections()`** — fix fences, glass panes, walls after building
+5. `build_smart_path()` to connect buildings with terrain-following paths
+6. `level.save()` periodically for large builds
+7. `save_and_close(level)` when done
 
 ## Common Mistakes
 

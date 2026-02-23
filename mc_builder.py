@@ -97,6 +97,56 @@ POTTED_FLOWERS = [
     "potted_allium", "potted_fern", "potted_azure_bluet",
 ]
 
+# 可连接方块分类 (需要 update_connections 后处理)
+# 类型1: north/south/east/west = "true"/"false" (fence, glass_pane, iron_bars)
+_CONNECTABLE_BOOL = set()
+for _wood in ("oak", "spruce", "birch", "dark_oak", "jungle", "acacia",
+              "mangrove", "cherry", "crimson", "warped", "bamboo"):
+    _CONNECTABLE_BOOL.add(f"{_wood}_fence")
+_CONNECTABLE_BOOL.update({"nether_brick_fence", "iron_bars",
+    "glass_pane",
+    "white_stained_glass_pane", "orange_stained_glass_pane",
+    "magenta_stained_glass_pane", "light_blue_stained_glass_pane",
+    "yellow_stained_glass_pane", "lime_stained_glass_pane",
+    "pink_stained_glass_pane", "gray_stained_glass_pane",
+    "light_gray_stained_glass_pane", "cyan_stained_glass_pane",
+    "purple_stained_glass_pane", "blue_stained_glass_pane",
+    "brown_stained_glass_pane", "green_stained_glass_pane",
+    "red_stained_glass_pane", "black_stained_glass_pane",
+})
+
+# 类型2: north/south/east/west = "none"/"low"/"tall", up = "true"/"false" (walls)
+_CONNECTABLE_WALL = set()
+for _mat in ("cobblestone", "mossy_cobblestone", "stone_brick", "mossy_stone_brick",
+             "granite", "diorite", "andesite", "brick", "prismarine",
+             "red_sandstone", "sandstone", "nether_brick", "red_nether_brick",
+             "end_stone_brick", "blackstone", "polished_blackstone",
+             "polished_blackstone_brick", "cobbled_deepslate",
+             "polished_deepslate", "deepslate_brick", "deepslate_tile", "mud_brick"):
+    _CONNECTABLE_WALL.add(f"{_mat}_wall")
+
+# 实心方块（fence/pane/wall 可以连接到这些方块）
+# 判定方法：不在已知透明/非实心列表中的方块视为实心
+_NON_SOLID = {"air", "water", "lava", "torch", "wall_torch", "soul_torch",
+    "soul_wall_torch", "redstone_torch", "redstone_wall_torch",
+    "lantern", "soul_lantern", "chain",
+    "flower_pot", "potted_poppy", "potted_dandelion",
+    "short_grass", "tall_grass", "fern", "large_fern", "dead_bush",
+    "poppy", "dandelion", "blue_orchid", "allium", "azure_bluet",
+    "cornflower", "lily_of_the_valley", "oxeye_daisy",
+    "red_tulip", "orange_tulip", "pink_tulip", "white_tulip",
+    "sugar_cane", "vine", "ladder", "lever", "tripwire", "tripwire_hook",
+    "string", "cobweb", "snow", "carpet",
+    "red_mushroom", "brown_mushroom", "crimson_fungus", "warped_fungus",
+    "sign", "oak_sign", "spruce_sign", "birch_sign", "dark_oak_sign",
+    "oak_wall_sign", "spruce_wall_sign", "birch_wall_sign",
+    "bamboo", "scaffolding", "light", "structure_void", "barrier",
+    "button", "oak_button", "stone_button", "pressure_plate",
+    "oak_pressure_plate", "stone_pressure_plate",
+    "rail", "powered_rail", "detector_rail", "activator_rail",
+    "redstone_wire", "repeater", "comparator",
+}
+
 # ============================================
 # 核心: 存档管理
 # ============================================
@@ -211,6 +261,117 @@ def get_block_full(level, x, y, z, dimension, game_version):
     """读取指定位置的方块, 返回完整命名空间 (如 'minecraft:grass_block')"""
     block, _ = level.get_version_block(x, y, z, dimension, game_version)
     return f"{block.namespace}:{block.base_name}"
+
+def _is_solid_for_connection(block_name):
+    """判断方块是否为"实心"（fence/pane/wall 可以连接到它）"""
+    if block_name in _NON_SOLID:
+        return False
+    # 同类可连接方块也算可连接
+    if block_name in _CONNECTABLE_BOOL or block_name in _CONNECTABLE_WALL:
+        return True
+    # 门、活板门、栅栏门等不算实心但某些可以连接
+    if "fence_gate" in block_name:
+        return True
+    # 其他未知方块：slab/stairs 等半砖不一定实心，保守处理
+    if block_name in _NON_SOLID:
+        return False
+    # 默认认为是实心
+    return block_name != "air"
+
+def update_connections(level, x1, z1, x2, z2, dim, ver, y1=None, y2=None):
+    """后处理: 修复区域内所有 fence/glass_pane/wall/iron_bars 的连接属性
+    在建筑完成后调用一次即可。
+    y1/y2: y 范围, 默认 0~255"""
+    import amulet
+    from amulet.api.block import Block
+
+    min_x, max_x = min(x1, x2), max(x1, x2)
+    min_z, max_z = min(z1, z2), max(z1, z2)
+    min_y = y1 if y1 is not None else 0
+    max_y = y2 if y2 is not None else 255
+    count = 0
+
+    for x in range(min_x, max_x + 1):
+        for z in range(min_z, max_z + 1):
+            for y in range(min_y, max_y + 1):
+                bid = get_block(level, x, y, z, dim, ver)
+
+                if bid in _CONNECTABLE_BOOL:
+                    # 读取当前方块的其他属性 (waterlogged 等)
+                    block, _ = level.get_version_block(x, y, z, dim, ver)
+                    old_props = {}
+                    if hasattr(block, 'properties'):
+                        for k, v in block.properties.items():
+                            old_props[k] = str(v)
+
+                    # 检查四个方向邻居
+                    n_north = get_block(level, x, y, z - 1, dim, ver)
+                    n_south = get_block(level, x, y, z + 1, dim, ver)
+                    n_west = get_block(level, x - 1, y, z, dim, ver)
+                    n_east = get_block(level, x + 1, y, z, dim, ver)
+
+                    new_props = dict(old_props)
+                    new_props["north"] = "true" if _is_solid_for_connection(n_north) else "false"
+                    new_props["south"] = "true" if _is_solid_for_connection(n_south) else "false"
+                    new_props["west"] = "true" if _is_solid_for_connection(n_west) else "false"
+                    new_props["east"] = "true" if _is_solid_for_connection(n_east) else "false"
+
+                    tag_props = {}
+                    for k, v in new_props.items():
+                        tag_props[k] = amulet.StringTag(str(v))
+                    new_block = Block("minecraft", bid, tag_props)
+                    level.set_version_block(x, y, z, dim, ver, new_block)
+                    count += 1
+
+                elif bid in _CONNECTABLE_WALL:
+                    block, _ = level.get_version_block(x, y, z, dim, ver)
+                    old_props = {}
+                    if hasattr(block, 'properties'):
+                        for k, v in block.properties.items():
+                            old_props[k] = str(v)
+
+                    n_north = get_block(level, x, y, z - 1, dim, ver)
+                    n_south = get_block(level, x, y, z + 1, dim, ver)
+                    n_west = get_block(level, x - 1, y, z, dim, ver)
+                    n_east = get_block(level, x + 1, y, z, dim, ver)
+                    n_above = get_block(level, x, y + 1, z, dim, ver)
+
+                    def wall_side(neighbor):
+                        if not _is_solid_for_connection(neighbor):
+                            return "none"
+                        if neighbor in _CONNECTABLE_WALL:
+                            return "low"
+                        return "low"  # 连接到实心方块时默认 low
+
+                    new_props = dict(old_props)
+                    new_props["north"] = wall_side(n_north)
+                    new_props["south"] = wall_side(n_south)
+                    new_props["west"] = wall_side(n_west)
+                    new_props["east"] = wall_side(n_east)
+
+                    # up: 有方块在上方、或是拐角/末端/T字形时为 true
+                    sides_connected = sum(1 for d in ["north","south","east","west"]
+                                          if new_props[d] != "none")
+                    is_straight_ns = (new_props["north"] != "none" and new_props["south"] != "none"
+                                      and new_props["east"] == "none" and new_props["west"] == "none")
+                    is_straight_ew = (new_props["east"] != "none" and new_props["west"] != "none"
+                                      and new_props["north"] == "none" and new_props["south"] == "none")
+                    is_straight = is_straight_ns or is_straight_ew
+
+                    if _is_solid_for_connection(n_above) or not is_straight or sides_connected != 2:
+                        new_props["up"] = "true"
+                    else:
+                        new_props["up"] = "false"
+
+                    tag_props = {}
+                    for k, v in new_props.items():
+                        tag_props[k] = amulet.StringTag(str(v))
+                    new_block = Block("minecraft", bid, tag_props)
+                    level.set_version_block(x, y, z, dim, ver, new_block)
+                    count += 1
+
+    print(f"连接修复完成: {count} 个方块已更新")
+    return count
 
 # ============================================
 # 地形工具
