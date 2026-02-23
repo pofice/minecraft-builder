@@ -13,6 +13,8 @@ import os
 import math
 import shutil
 import random
+import json
+import heapq
 from pathlib import Path
 from datetime import datetime
 
@@ -21,6 +23,7 @@ from datetime import datetime
 # ============================================
 
 SAVES_DIR = os.path.expanduser("~/Library/Application Support/minecraft/saves")
+TEMPLATES_DIR = os.path.expanduser("~/.claude/skills/minecraft-builder/templates")
 
 # 常见方块名纠正表 (错误名 -> 正确名)
 BLOCK_ALIASES = {
@@ -29,7 +32,57 @@ BLOCK_ALIASES = {
     "oak_plank": "oak_planks", "spruce_plank": "spruce_planks",
     "birch_plank": "birch_planks", "dark_oak_plank": "dark_oak_planks",
     "stone_brick": "stone_bricks", "cobble": "cobblestone",
-    "wood": "oak_planks", "glass": "glass_block",
+    "wood": "oak_planks",
+}
+
+# 自然地面方块 (scan_ground 识别为地面)
+NATURAL_GROUND = {
+    "grass_block", "dirt", "coarse_dirt", "podzol", "mycelium",
+    "stone", "granite", "diorite", "andesite", "deepslate",
+    "sand", "red_sand", "gravel", "clay", "mud", "soul_sand", "soul_soil",
+    "sandstone", "red_sandstone", "terracotta", "calcite", "tuff",
+    "snow_block", "ice", "packed_ice", "blue_ice",
+    "netherrack", "basalt", "blackstone", "end_stone",
+    "bedrock", "moss_block",
+}
+
+# 已知建筑方块 (scan_ground 会跳过)
+BUILDING_BLOCKS = {
+    "oak_planks", "spruce_planks", "birch_planks", "dark_oak_planks",
+    "jungle_planks", "acacia_planks", "mangrove_planks", "cherry_planks",
+    "crimson_planks", "warped_planks", "bamboo_planks",
+    "oak_stairs", "spruce_stairs", "birch_stairs", "dark_oak_stairs",
+    "jungle_stairs", "acacia_stairs", "stone_stairs", "stone_brick_stairs",
+    "cobblestone_stairs", "brick_stairs", "sandstone_stairs",
+    "oak_slab", "spruce_slab", "birch_slab", "dark_oak_slab",
+    "stone_slab", "stone_brick_slab", "cobblestone_slab", "brick_slab",
+    "oak_log", "spruce_log", "birch_log", "dark_oak_log",
+    "jungle_log", "acacia_log", "mangrove_log", "cherry_log",
+    "stripped_oak_log", "stripped_spruce_log", "stripped_birch_log",
+    "stripped_dark_oak_log", "stripped_jungle_log", "stripped_acacia_log",
+    "oak_wood", "spruce_wood", "birch_wood", "dark_oak_wood",
+    "oak_leaves", "spruce_leaves", "birch_leaves", "dark_oak_leaves",
+    "jungle_leaves", "acacia_leaves", "azalea_leaves",
+    "glass", "glass_pane",
+    "white_stained_glass", "light_gray_stained_glass", "light_blue_stained_glass",
+    "cyan_stained_glass", "orange_stained_glass",
+    "stone_bricks", "mossy_stone_bricks", "cracked_stone_bricks",
+    "bricks", "cobblestone", "mossy_cobblestone",
+    "polished_granite", "polished_diorite", "polished_andesite",
+    "smooth_stone", "smooth_stone_slab",
+    "iron_block", "gold_block", "diamond_block",
+    "white_concrete", "light_gray_concrete",
+    "white_terracotta", "orange_terracotta", "light_gray_terracotta",
+    "white_wool", "light_gray_wool",
+    "crafting_table", "furnace", "chest", "barrel", "bookshelf",
+    "lantern", "torch", "wall_torch", "campfire", "sea_lantern", "glowstone",
+    "iron_door", "oak_door", "spruce_door", "birch_door", "dark_oak_door",
+    "oak_fence", "spruce_fence", "birch_fence", "dark_oak_fence",
+    "oak_fence_gate", "spruce_fence_gate",
+    "ladder", "scaffolding",
+    "polished_blackstone", "polished_blackstone_bricks",
+    "deepslate_bricks", "polished_deepslate",
+    "quartz_block", "quartz_pillar", "smooth_quartz",
 }
 
 # 常用花卉列表 (正确的方块名)
@@ -150,7 +203,12 @@ def place_block(level, x, y, z, dimension, game_version, block_name, properties=
     level.set_version_block(x, y, z, dimension, game_version, block)
 
 def get_block(level, x, y, z, dimension, game_version):
-    """读取指定位置的方块, 返回 (namespace, base_name)"""
+    """读取指定位置的方块, 返回 base_name (如 'grass_block', 'air')"""
+    block, _ = level.get_version_block(x, y, z, dimension, game_version)
+    return block.base_name
+
+def get_block_full(level, x, y, z, dimension, game_version):
+    """读取指定位置的方块, 返回完整命名空间 (如 'minecraft:grass_block')"""
     block, _ = level.get_version_block(x, y, z, dimension, game_version)
     return f"{block.namespace}:{block.base_name}"
 
@@ -165,8 +223,8 @@ def scan_terrain(level, cx, cz, dim, ver, radius=80, base_y=64):
         for z in range(cz - radius, cz + radius):
             for y in range(base_y + 40, base_y - 40, -1):
                 bid = get_block(level, x, y, z, dim, ver)
-                if bid != "minecraft:air":
-                    if bid != "minecraft:water":
+                if bid != "air":
+                    if bid != "water":
                         height_map[(x, z)] = y
                     break
     return height_map
@@ -180,22 +238,93 @@ def get_terrain_bounds(height_map):
     ys = list(height_map.values())
     return (min(xs), max(xs), min(zs), max(zs), min(ys), max(ys))
 
+def scan_ground(level, cx, cz, dim, ver, radius=80):
+    """扫描真实地面高度, 跳过建筑方块和树叶, 只返回自然地面
+    返回 height_map: {(x,z): y}"""
+    height_map = {}
+    for x in range(cx - radius, cx + radius):
+        for z in range(cz - radius, cz + radius):
+            for y in range(100, 30, -1):
+                bid = get_block(level, x, y, z, dim, ver)
+                if bid == "air" or bid == "water":
+                    continue
+                if bid in BUILDING_BLOCKS:
+                    continue
+                # 跳过植被（花、草、蘑菇等短植物）
+                if bid in ("short_grass", "tall_grass", "fern", "large_fern",
+                           "dead_bush", "sweet_berry_bush", "seagrass",
+                           "sugar_cane", "bamboo", "vine", "kelp",
+                           "brown_mushroom", "red_mushroom") or bid in FLOWERS:
+                    continue
+                if bid in NATURAL_GROUND:
+                    height_map[(x, z)] = y
+                    break
+                # 未知方块：如果在自然地面集合外也不在建筑集合，保守当作地面
+                height_map[(x, z)] = y
+                break
+    return height_map
+
 def flatten_area(level, x1, z1, x2, z2, target_y, dim, ver,
-                 surface="grass_block", underground="dirt", clear_above=20):
+                 surface="grass_block", underground="dirt", clear_above=20,
+                 blend_radius=0):
     """平整一块区域到指定高度
     - 高于 target_y 的方块清除
     - 低于 target_y 的方块填充
     - surface: 地表方块
     - underground: 地下填充方块
+    - blend_radius: 外围渐变过渡范围 (0=不过渡)
     """
+    min_x, max_x = min(x1, x2), max(x1, x2)
+    min_z, max_z = min(z1, z2), max(z1, z2)
     surface_props = {"snowy": "false"} if surface == "grass_block" else None
-    for x in range(min(x1, x2), max(x1, x2) + 1):
-        for z in range(min(z1, z2), max(z1, z2) + 1):
+
+    # 核心区域平整
+    for x in range(min_x, max_x + 1):
+        for z in range(min_z, max_z + 1):
             place_block(level, x, target_y, z, dim, ver, surface, surface_props)
             for dy in range(1, clear_above + 1):
                 place_block(level, x, target_y + dy, z, dim, ver, "air")
             for dy in range(1, 4):
                 place_block(level, x, target_y - dy, z, dim, ver, underground)
+
+    # 边缘渐变过渡
+    if blend_radius > 0:
+        blend_surfaces = ["coarse_dirt", "podzol", "dirt"]
+        for x in range(min_x - blend_radius, max_x + blend_radius + 1):
+            for z in range(min_z - blend_radius, max_z + blend_radius + 1):
+                # 跳过核心区域
+                if min_x <= x <= max_x and min_z <= z <= max_z:
+                    continue
+                # 计算到核心区域边缘的距离
+                dx = max(0, max(min_x - x, x - max_x))
+                dz = max(0, max(min_z - z, z - max_z))
+                dist = math.sqrt(dx * dx + dz * dz)
+                if dist > blend_radius:
+                    continue
+                # 读取该位置的自然地面高度
+                natural_y = None
+                for y in range(100, 30, -1):
+                    bid = get_block(level, x, y, z, dim, ver)
+                    if bid != "air" and bid != "water":
+                        natural_y = y
+                        break
+                if natural_y is None:
+                    continue
+                # 线性插值
+                t = dist / blend_radius  # 0=边缘(target_y), 1=远处(natural_y)
+                blend_y = int(target_y + (natural_y - target_y) * t)
+                # 放置过渡方块
+                if blend_y > natural_y:
+                    for y in range(natural_y + 1, blend_y + 1):
+                        surf = random.choice(blend_surfaces) if random.random() < 0.4 else surface
+                        s_props = {"snowy": "false"} if surf == "grass_block" else None
+                        place_block(level, x, y, z, dim, ver, surf, s_props)
+                elif blend_y < natural_y:
+                    for y in range(blend_y + 1, natural_y + 1):
+                        place_block(level, x, y, z, dim, ver, "air")
+                    surf = random.choice(blend_surfaces) if random.random() < 0.4 else surface
+                    s_props = {"snowy": "false"} if surf == "grass_block" else None
+                    place_block(level, x, blend_y, z, dim, ver, surf, s_props)
 
 def clear_vegetation(level, x1, z1, x2, z2, y_base, dim, ver, height=25):
     """清除地面以上的植被(树木、花草等), 保留地面"""
@@ -203,6 +332,121 @@ def clear_vegetation(level, x1, z1, x2, z2, y_base, dim, ver, height=25):
         for z in range(min(z1, z2), max(z1, z2) + 1):
             for y in range(y_base + 1, y_base + height):
                 place_block(level, x, y, z, dim, ver, "air")
+
+def build_smart_path(level, start, end, dim, ver, width=2, block="stone_bricks"):
+    """A* 智能路径: 自动寻路, 避开建筑和树木, 沿地面铺设
+    start/end: (x, z) 元组
+    返回路径坐标列表 [(x, y, z), ...]"""
+    sx, sz = start
+    ex, ez = end
+
+    # 扫描路径范围的地面
+    min_x = min(sx, ex) - 20
+    max_x = max(sx, ex) + 20
+    min_z = min(sz, ez) - 20
+    max_z = max(sz, ez) + 20
+    cx = (sx + ex) // 2
+    cz = (sz + ez) // 2
+    radius = max(abs(max_x - min_x), abs(max_z - min_z)) // 2 + 5
+
+    ground = scan_ground(level, cx, cz, dim, ver, radius=radius)
+
+    # 检测哪些格子上方有建筑（用 scan_terrain 对比 scan_ground）
+    blocked = set()
+    for x in range(min_x, max_x + 1):
+        for z in range(min_z, max_z + 1):
+            if (x, z) not in ground:
+                blocked.add((x, z))
+                continue
+            gy = ground[(x, z)]
+            # 检查地面上方是否有非自然方块（建筑）
+            for dy in range(1, 6):
+                bid = get_block(level, x, gy + dy, z, dim, ver)
+                if bid in BUILDING_BLOCKS:
+                    blocked.add((x, z))
+                    break
+
+    # A* 寻路
+    def heuristic(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    start_node = (sx, sz)
+    end_node = (ex, ez)
+    open_set = [(0, start_node)]
+    came_from = {}
+    g_score = {start_node: 0}
+
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                 (-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+        if current == end_node:
+            break
+
+        for dx, dz in neighbors:
+            nx, nz = current[0] + dx, current[1] + dz
+            neighbor = (nx, nz)
+
+            if neighbor in blocked:
+                continue
+            if neighbor not in ground:
+                continue
+
+            # 高度差惩罚
+            curr_y = ground.get(current, 64)
+            next_y = ground.get(neighbor, 64)
+            height_cost = abs(next_y - curr_y) * 3
+
+            # 对角线移动代价 1.4
+            move_cost = 1.414 if (dx != 0 and dz != 0) else 1.0
+            tentative_g = g_score[current] + move_cost + height_cost
+
+            if tentative_g < g_score.get(neighbor, float('inf')):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score = tentative_g + heuristic(neighbor, end_node)
+                heapq.heappush(open_set, (f_score, neighbor))
+
+    # 重建路径
+    path = []
+    current = end_node
+    if current not in came_from and current != start_node:
+        print("警告: A* 寻路失败, 回退到直线路径")
+        # 回退: 直线路径
+        dx = 1 if ex > sx else (-1 if ex < sx else 0)
+        dz = 1 if ez > sz else (-1 if ez < sz else 0)
+        x, z = sx, sz
+        while x != ex or z != ez:
+            y = ground.get((x, z), 64)
+            path.append((x, y, z))
+            if x != ex and (z == ez or random.random() < 0.5):
+                x += dx
+            elif z != ez:
+                z += dz
+        path.append((ex, ground.get((ex, ez), 64), ez))
+    else:
+        while current in came_from:
+            y = ground.get(current, 64)
+            path.append((current[0], y, current[1]))
+            current = came_from[current]
+        path.append((sx, ground.get(start_node, 64), sz))
+        path.reverse()
+
+    # 铺设路径
+    half_w = width // 2
+    for px, py, pz in path:
+        for ox in range(-half_w, half_w + 1):
+            for oz in range(-half_w, half_w + 1):
+                # 清除路面上方低矮植被
+                for dy in range(1, 4):
+                    bid = get_block(level, px + ox, py + dy, pz + oz, dim, ver)
+                    if bid not in ("air", "water"):
+                        place_block(level, px + ox, py + dy, pz + oz, dim, ver, "air")
+                place_block(level, px + ox, py, pz + oz, dim, ver, block)
+
+    print(f"智能路径完成: {start} -> {end}, {len(path)} 格, 宽度 {width}")
+    return path
 
 # ============================================
 # 基础建筑原语
@@ -674,6 +918,172 @@ def build_dock(level, bx, by, bz, dim, ver, length=18, width=5):
         place_lantern_post(level, bx + dx, by, bz + length - 1, dim, ver, height=3)
 
     print(f"码头建造完成: ({bx},{by},{bz}) 长{length}")
+
+# ============================================
+# 结构扫描 / 模板系统
+# ============================================
+
+def scan_structure(level, x1, y1, z1, x2, y2, z2, dim, ver):
+    """扫描指定范围内所有非空气方块, 返回模板数据
+    坐标转为相对坐标 (相对于 x1,y1,z1)"""
+    min_x, max_x = min(x1, x2), max(x1, x2)
+    min_y, max_y = min(y1, y2), max(y1, y2)
+    min_z, max_z = min(z1, z2), max(z1, z2)
+    dx = max_x - min_x + 1
+    dy = max_y - min_y + 1
+    dz = max_z - min_z + 1
+
+    blocks = []
+    for x in range(min_x, max_x + 1):
+        for y in range(min_y, max_y + 1):
+            for z in range(min_z, max_z + 1):
+                block, _ = level.get_version_block(x, y, z, dim, ver)
+                name = block.base_name
+                if name == "air":
+                    continue
+                entry = {
+                    "pos": [x - min_x, y - min_y, z - min_z],
+                    "name": name,
+                }
+                # 提取方块属性
+                props = {}
+                if hasattr(block, 'properties'):
+                    for k, v in block.properties.items():
+                        props[k] = str(v)
+                if props:
+                    entry["props"] = props
+                blocks.append(entry)
+
+    template = {
+        "size": [dx, dy, dz],
+        "block_count": len(blocks),
+        "blocks": blocks,
+        "meta": {
+            "scanned_from": [min_x, min_y, min_z],
+            "scanned_to": [max_x, max_y, max_z],
+        }
+    }
+    print(f"扫描完成: {dx}x{dy}x{dz}, {len(blocks)} 个方块")
+    return template
+
+def save_template(template, filepath=None, name=None):
+    """保存模板到 JSON 文件
+    filepath: 完整路径, 或 name: 自动保存到 templates 目录"""
+    if filepath is None:
+        if name is None:
+            name = f"template_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(TEMPLATES_DIR, exist_ok=True)
+        filepath = os.path.join(TEMPLATES_DIR, f"{name}.json")
+    with open(filepath, "w") as f:
+        json.dump(template, f, indent=2)
+    print(f"模板已保存: {filepath} ({template['block_count']} 个方块)")
+    return filepath
+
+def load_template(filepath):
+    """从 JSON 文件加载模板"""
+    if not os.path.isabs(filepath):
+        # 尝试从 templates 目录加载
+        candidate = os.path.join(TEMPLATES_DIR, filepath)
+        if os.path.exists(candidate):
+            filepath = candidate
+        elif os.path.exists(candidate + ".json"):
+            filepath = candidate + ".json"
+    with open(filepath, "r") as f:
+        template = json.load(f)
+    print(f"模板已加载: {filepath} (大小 {template['size']}, {template['block_count']} 个方块)")
+    return template
+
+def _rotate_pos(rx, ry, rz, sx, sy, sz, angle):
+    """旋转相对坐标 (围绕 y 轴)"""
+    if angle == 0:
+        return rx, ry, rz
+    elif angle == 90:
+        return sz - 1 - rz, ry, rx
+    elif angle == 180:
+        return sx - 1 - rx, ry, sz - 1 - rz
+    elif angle == 270:
+        return rz, ry, sx - 1 - rx
+    return rx, ry, rz
+
+def _rotate_facing(facing, angle):
+    """旋转 facing 属性"""
+    directions = ["north", "east", "south", "west"]
+    if facing not in directions:
+        return facing
+    idx = directions.index(facing)
+    steps = angle // 90
+    return directions[(idx + steps) % 4]
+
+def _rotate_axis(axis, angle):
+    """旋转 axis 属性"""
+    if angle in (90, 270):
+        if axis == "x":
+            return "z"
+        elif axis == "z":
+            return "x"
+    return axis
+
+def paste_structure(level, template, x, y, z, dim, ver, rotate=0, mirror=False):
+    """在指定位置粘贴模板
+    rotate: 0/90/180/270 度
+    mirror: 是否沿 x 轴镜像"""
+    sx, sy, sz = template["size"]
+    count = 0
+    for entry in template["blocks"]:
+        rx, ry, rz = entry["pos"]
+        name = entry["name"]
+        props = dict(entry.get("props", {}))
+
+        # 镜像
+        if mirror:
+            rx = sx - 1 - rx
+            if "facing" in props:
+                f = props["facing"]
+                if f == "east":
+                    props["facing"] = "west"
+                elif f == "west":
+                    props["facing"] = "east"
+
+        # 旋转
+        rx, ry, rz = _rotate_pos(rx, ry, rz, sx, sy, sz, rotate)
+        if "facing" in props:
+            props["facing"] = _rotate_facing(props["facing"], rotate)
+        if "axis" in props:
+            props["axis"] = _rotate_axis(props["axis"], rotate)
+
+        place_block(level, x + rx, y + ry, z + rz, dim, ver, name, props if props else None)
+        count += 1
+
+    print(f"粘贴完成: ({x},{y},{z}), {count} 个方块, 旋转 {rotate}°{' 镜像' if mirror else ''}")
+    return count
+
+def list_templates(directory=None):
+    """列出模板目录中所有可用模板"""
+    if directory is None:
+        directory = TEMPLATES_DIR
+    if not os.path.isdir(directory):
+        print(f"模板目录不存在: {directory}")
+        return []
+    templates = []
+    for fname in sorted(os.listdir(directory)):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(directory, fname)
+        try:
+            with open(fpath, "r") as f:
+                data = json.load(f)
+            templates.append({
+                "name": fname[:-5],
+                "file": fpath,
+                "size": data.get("size", [0, 0, 0]),
+                "block_count": data.get("block_count", 0),
+            })
+        except (json.JSONDecodeError, KeyError):
+            continue
+    print(f"找到 {len(templates)} 个模板")
+    for t in templates:
+        print(f"  {t['name']}: {t['size'][0]}x{t['size'][1]}x{t['size'][2]}, {t['block_count']} 方块")
+    return templates
 
 # ============================================
 # CLI

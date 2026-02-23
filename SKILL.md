@@ -12,6 +12,7 @@ Build structures in Minecraft Java Edition saves by programmatically placing blo
 - User asks to build/construct anything in a Minecraft world
 - User asks to modify terrain, clear trees, flatten land
 - User mentions building a house, tower, castle, farm, village, airport, etc.
+- User wants to scan/copy/paste structures or use templates
 
 ## Prerequisites
 
@@ -53,9 +54,10 @@ save_and_close(level)
 
 | Function | Purpose |
 |----------|---------|
-| `flatten_area(level, x1,z1, x2,z2, y, dim, ver)` | Flatten area to height, fill underground, clear above |
+| `flatten_area(level, x1,z1, x2,z2, y, dim, ver, blend_radius=0)` | Flatten area to height; `blend_radius=N` adds edge blending |
 | `clear_vegetation(level, x1,z1, x2,z2, y_base, dim, ver)` | Remove trees/plants above ground |
-| `scan_terrain(level, cx,cz, dim, ver, radius)` | Scan terrain heights, returns `{(x,z): y}` |
+| `scan_terrain(level, cx,cz, dim, ver, radius)` | Scan terrain heights (includes buildings), returns `{(x,z): y}` |
+| `scan_ground(level, cx,cz, dim, ver, radius)` | Scan **natural ground** heights (skips buildings/trees), returns `{(x,z): y}` |
 | `get_terrain_bounds(height_map)` | Get `(min_x, max_x, min_z, max_z, min_y, max_y)` |
 
 ### Building Primitives
@@ -63,7 +65,8 @@ save_and_close(level)
 | Function | Purpose |
 |----------|---------|
 | `place_block(…, block_name, props)` | Place one block (auto-corrects common name typos) |
-| `get_block(level, x,y,z, dim, ver)` | Read block at position |
+| `get_block(level, x,y,z, dim, ver)` | Read block at position, returns `base_name` (e.g. `"grass_block"`) |
+| `get_block_full(level, x,y,z, dim, ver)` | Read block with namespace (e.g. `"minecraft:grass_block"`) |
 | `build_box(…, hollow=False)` | Solid or hollow box |
 | `build_walls(…, wall, corner)` | Four walls with corner material |
 | `build_floor(…, checkerboard=block2)` | Floor with optional checkerboard |
@@ -72,6 +75,14 @@ save_and_close(level)
 | `build_cone(…, radius, height)` | Cone / conical roof |
 | `build_arch(…, z1, z2, height)` | Arch gate along z-axis |
 | `build_pitched_roof(…, axis)` | Sloped stair/slab roof |
+
+### Smart Pathfinding
+
+| Function | Purpose |
+|----------|---------|
+| `build_smart_path(level, start, end, dim, ver, width=2, block="stone_bricks")` | A* pathfinding that avoids buildings/trees, follows terrain |
+
+`start`/`end` are `(x, z)` tuples. Returns path coords `[(x, y, z), ...]`.
 
 ### Furniture & Decoration
 
@@ -82,7 +93,7 @@ save_and_close(level)
 | `place_windows(…, spacing, glass)` | Windows along walls |
 | `place_lantern_post(…, height)` | Fence post + lantern |
 | `place_tree(…, trunk, leaves)` | Simple tree |
-| `build_path(…, width, block)` | Dirt path between two points |
+| `build_path(…, width, block)` | Simple dirt path between two points (no pathfinding) |
 
 ### Preset Buildings
 
@@ -95,11 +106,40 @@ save_and_close(level)
 | `build_farm(…, crops)` | Fenced farmland with water channels |
 | `build_dock(…, length, width)` | Wooden pier extending over water |
 
+### Structure Scanning & Templates
+
+| Function | Purpose |
+|----------|---------|
+| `scan_structure(level, x1,y1,z1, x2,y2,z2, dim, ver)` | Scan all non-air blocks in a region, returns template dict |
+| `save_template(template, filepath=None, name=None)` | Save template to JSON file |
+| `load_template(filepath)` | Load template from JSON (supports name-only lookup in templates dir) |
+| `paste_structure(level, template, x,y,z, dim, ver, rotate=0, mirror=False)` | Place template at position with rotation/mirror |
+| `list_templates(directory=None)` | List all available templates |
+
+Templates are stored in `~/.claude/skills/minecraft-builder/templates/`.
+
+#### Template Workflow: Learning from Builds
+
+```python
+# 1. Scan an existing structure
+template = scan_structure(level, x1, y1, z1, x2, y2, z2, dim, ver)
+
+# 2. Save it
+save_template(template, name="cool_house")
+
+# 3. Later, load and paste it elsewhere
+t = load_template("cool_house")
+paste_structure(level, t, new_x, new_y, new_z, dim, ver, rotate=90)
+
+# 4. List available templates
+list_templates()
+```
+
 ## Block Name Auto-Correction
 
 Common mistakes are auto-fixed: `tulip_red`→`red_tulip`, `oak_plank`→`oak_planks`, etc. See `BLOCK_ALIASES` dict in mc_builder.py.
 
-Constants available: `FLOWERS` (list of valid flower names), `POTTED_FLOWERS`.
+Constants available: `FLOWERS`, `POTTED_FLOWERS`, `NATURAL_GROUND`, `BUILDING_BLOCKS`.
 
 ## Block Properties Cheatsheet
 
@@ -121,10 +161,11 @@ Constants available: `FLOWERS` (list of valid flower names), `POTTED_FLOWERS`.
 ## Building Workflow
 
 1. `quick_setup()` — auto backup + player pos + version
-2. `scan_terrain()` / `flatten_area()` — understand and prepare terrain
+2. `scan_terrain()` / `scan_ground()` / `flatten_area()` — understand and prepare terrain
 3. Build bottom-up: foundation → floor → walls → interior → roof → decoration
-4. `level.save()` periodically for large builds
-5. `save_and_close(level)` when done
+4. `build_smart_path()` to connect buildings with terrain-following paths
+5. `level.save()` periodically for large builds
+6. `save_and_close(level)` when done
 
 ## Common Mistakes
 
@@ -133,3 +174,5 @@ Constants available: `FLOWERS` (list of valid flower names), `POTTED_FLOWERS`.
 - **Forgetting save_and_close:** Changes are lost.
 - **Building at player feet:** Offset by 3-5+ blocks.
 - **Large builds without periodic save:** Call `level.save()` every few thousand blocks to avoid data loss on error.
+- **`get_block()` returns base_name only:** e.g. `"grass_block"`, not `"minecraft:grass_block"`. Use `get_block_full()` if you need the namespace.
+- **Paths on rooftops:** Use `scan_ground()` instead of `scan_terrain()` to get natural ground heights that skip buildings.
